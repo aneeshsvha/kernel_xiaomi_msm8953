@@ -228,6 +228,10 @@ struct fsxattr {
 #define BLKZEROOUT _IO(0x12,127)
 #define BLKGETSTPART _IO(0x12, 128)
 
+/*
+ * A jump here: 130-131 are reserved for zoned block devices
+ * (see uapi/linux/blkzoned.h)
+ */
 #define BMAP_IOCTL 1		/* obsolete - kept for compatibility */
 #define FIBMAP	   _IO(0x00,1)	/* bmap access */
 #define FIGETBSZ   _IO(0x00,2)	/* get the block size used for bmap */
