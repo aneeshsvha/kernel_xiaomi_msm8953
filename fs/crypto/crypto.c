@@ -86,6 +86,68 @@ EXPORT_SYMBOL(fscrypt_release_ctx);
  *
  * Return: A new decryption context on success; an ERR_PTR() otherwise.
  */
+ /**
+ * fscrypt_free_bounce_page() - free a ciphertext bounce page
+ * @bounce_page: the bounce page to free, or NULL
+ *
+ * Free a bounce page that was allocated by fscrypt_encrypt_pagecache_blocks(),
+ * or by fscrypt_alloc_bounce_page() directly.
+ */
+void fscrypt_free_bounce_page(struct page *bounce_page)
+{
+	if (!bounce_page)
+		return;
+	set_page_private(bounce_page, (unsigned long)NULL);
+	ClearPagePrivate(bounce_page);
+	mempool_free(bounce_page, fscrypt_bounce_page_pool);
+}
+EXPORT_SYMBOL(fscrypt_free_bounce_page);
+
+/* Encrypt or decrypt a single filesystem block of file contents */
+int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
+			u64 lblk_num, struct page *src_page,
+			struct page *dest_page, unsigned int len,
+			unsigned int offs, gfp_t gfp_flags)
+{
+	union fscrypt_iv iv;
+	struct skcipher_request *req = NULL;
+	DECLARE_CRYPTO_WAIT(wait);
+	struct scatterlist dst, src;
+	struct fscrypt_info *ci = inode->i_crypt_info;
+	struct crypto_skcipher *tfm = ci->ci_key.tfm;
+	int res = 0;
+
+	if (WARN_ON_ONCE(len <= 0))
+		return -EINVAL;
+	if (WARN_ON_ONCE(len % FS_CRYPTO_BLOCK_SIZE != 0))
+		return -EINVAL;
+
+	fscrypt_generate_iv(&iv, lblk_num, ci);
+
+	req = skcipher_request_alloc(tfm, gfp_flags);
+	if (!req)
+		return -ENOMEM;
+
+	skcipher_request_set_callback(
+		req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
+		crypto_req_done, &wait);
+
+	sg_init_table(&dst, 1);
+	sg_set_page(&dst, dest_page, len, offs);
+	sg_init_table(&src, 1);
+	sg_set_page(&src, src_page, len, offs);
+	skcipher_request_set_crypt(req, &src, &dst, len, &iv);
+	if (rw == FS_DECRYPT)
+		res = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
+	else
+		res = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+	skcipher_request_free(req);
+	if (res) {
+		return res;
+	}
+	return 0;
+}
+
 struct fscrypt_ctx *fscrypt_get_ctx(gfp_t gfp_flags)
 {
 	struct fscrypt_ctx *ctx;
@@ -118,83 +180,36 @@ struct page *fscrypt_alloc_bounce_page(gfp_t gfp_flags)
 	return mempool_alloc(fscrypt_bounce_page_pool, gfp_flags);
 }
 
-/**
- * fscrypt_free_bounce_page() - free a ciphertext bounce page
- *
- * Free a bounce page that was allocated by fscrypt_encrypt_pagecache_blocks(),
- * or by fscrypt_alloc_bounce_page() directly.
- */
-void fscrypt_free_bounce_page(struct page *bounce_page)
-{
-	if (!bounce_page)
-		return;
-	set_page_private(bounce_page, (unsigned long)NULL);
-	ClearPagePrivate(bounce_page);
-	mempool_free(bounce_page, fscrypt_bounce_page_pool);
-}
-EXPORT_SYMBOL(fscrypt_free_bounce_page);
-
 void fscrypt_generate_iv(union fscrypt_iv *iv, u64 lblk_num,
-			 const struct fscrypt_info *ci)
+			const struct fscrypt_info *ci)
 {
+	u8 flags = fscrypt_policy_flags(&ci->ci_policy);
+
 	memset(iv, 0, ci->ci_mode->ivsize);
-	iv->lblk_num = cpu_to_le64(lblk_num);
 
-	if (ci->ci_flags & FS_POLICY_FLAG_DIRECT_KEY)
-		memcpy(iv->nonce, ci->ci_nonce, FS_KEY_DERIVATION_NONCE_SIZE);
-
-	if (ci->ci_essiv_tfm != NULL)
-		crypto_cipher_encrypt_one(ci->ci_essiv_tfm, iv->raw, iv->raw);
-}
-
-/* Encrypt or decrypt a single filesystem block of file contents */
-int fscrypt_crypt_block(const struct inode *inode, fscrypt_direction_t rw,
-			u64 lblk_num, struct page *src_page,
-			struct page *dest_page, unsigned int len,
-			unsigned int offs, gfp_t gfp_flags)
-{
-	union fscrypt_iv iv;
-	struct skcipher_request *req = NULL;
-	DECLARE_CRYPTO_WAIT(wait);
-	struct scatterlist dst, src;
-	struct fscrypt_info *ci = inode->i_crypt_info;
-	struct crypto_skcipher *tfm = ci->ci_ctfm;
-	int res = 0;
-
-	if (WARN_ON_ONCE(len <= 0))
-		return -EINVAL;
-	if (WARN_ON_ONCE(len % FS_CRYPTO_BLOCK_SIZE != 0))
-		return -EINVAL;
-
-	fscrypt_generate_iv(&iv, lblk_num, ci);
-
-	req = skcipher_request_alloc(tfm, gfp_flags);
-	if (!req)
-		return -ENOMEM;
-
-	skcipher_request_set_callback(
-		req, CRYPTO_TFM_REQ_MAY_BACKLOG | CRYPTO_TFM_REQ_MAY_SLEEP,
-		crypto_req_done, &wait);
-
-	sg_init_table(&dst, 1);
-	sg_set_page(&dst, dest_page, len, offs);
-	sg_init_table(&src, 1);
-	sg_set_page(&src, src_page, len, offs);
-	skcipher_request_set_crypt(req, &src, &dst, len, &iv);
-	if (rw == FS_DECRYPT)
-		res = crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
-	else
-		res = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
-	skcipher_request_free(req);
-	if (res) {
-		fscrypt_err(inode->i_sb,
-			    "%scryption failed for inode %lu, block %llu: %d",
-			    (rw == FS_DECRYPT ? "de" : "en"),
-			    inode->i_ino, lblk_num, res);
-		return res;
+	if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64) {
+		WARN_ON_ONCE(lblk_num > U32_MAX);
+		WARN_ON_ONCE(ci->ci_inode->i_ino > U32_MAX);
+		lblk_num |= (u64)ci->ci_inode->i_ino << 32;
+	} else if (flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) {
+		WARN_ON_ONCE(lblk_num > U32_MAX);
+		lblk_num = (u32)(ci->ci_hashed_ino + lblk_num);
+	} else if (flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY) {
+	memcpy(iv->nonce, ci->ci_nonce, FS_KEY_DERIVATION_NONCE_SIZE);
+	} else if ((fscrypt_policy_contents_mode(&ci->ci_policy) ==
+						127)
+						&& false) {
+		if (ci->ci_inode->i_sb->s_type->name) {
+			if (!strcmp(ci->ci_inode->i_sb->s_type->name, "f2fs")) {
+				WARN_ON_ONCE(lblk_num > U32_MAX);
+				WARN_ON_ONCE(ci->ci_inode->i_ino > U32_MAX);
+			lblk_num |= (u64)ci->ci_inode->i_ino << 32;
+			}
+		}
 	}
-	return 0;
+	iv->lblk_num = cpu_to_le64(lblk_num);
 }
+
 
 /**
  * fscrypt_encrypt_pagecache_blocks() - Encrypt filesystem blocks from a pagecache page
@@ -478,6 +493,7 @@ void fscrypt_msg(struct super_block *sb, const char *level,
  */
 static int __init fscrypt_init(void)
 {
+	int err = -ENOMEM;
 	/*
 	 * Use an unbound workqueue to allow bios to be decrypted in parallel
 	 * even when they happen to complete on the same CPU.  This sacrifices
@@ -500,31 +516,20 @@ static int __init fscrypt_init(void)
 	if (!fscrypt_info_cachep)
 		goto fail_free_ctx;
 
+	err = fscrypt_init_keyring();
+	if (err)
+		goto fail_free_info;
+
 	return 0;
 
 fail_free_ctx:
 	kmem_cache_destroy(fscrypt_ctx_cachep);
 fail_free_queue:
 	destroy_workqueue(fscrypt_read_workqueue);
-fail:
-	return -ENOMEM;
-}
-module_init(fscrypt_init)
-
-/**
- * fscrypt_exit() - Shutdown the fs encryption system
- */
-static void __exit fscrypt_exit(void)
-{
-	fscrypt_destroy();
-
-	if (fscrypt_read_workqueue)
-		destroy_workqueue(fscrypt_read_workqueue);
-	kmem_cache_destroy(fscrypt_ctx_cachep);
+fail_free_info:
 	kmem_cache_destroy(fscrypt_info_cachep);
-
-	fscrypt_essiv_cleanup();
+fail:
+	return err;
 }
-module_exit(fscrypt_exit);
-
+late_initcall(fscrypt_init)
 MODULE_LICENSE("GPL");

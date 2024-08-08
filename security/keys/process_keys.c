@@ -754,7 +754,7 @@ reget_creds:
 	put_cred(ctx.cred);
 	goto try_again;
 }
-
+EXPORT_SYMBOL(lookup_user_key);
 /*
  * Join the named keyring as the session keyring if possible else attempt to
  * create a new one of that name and join that.

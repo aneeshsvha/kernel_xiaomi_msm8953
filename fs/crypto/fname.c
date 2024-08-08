@@ -86,7 +86,7 @@ int fname_encrypt(struct inode *inode, const struct qstr *iname,
  *
  * Return: 0 on success, -errno on failure
  */
-static int fname_decrypt(struct inode *inode,
+static int fname_decrypt(const struct inode *inode,
 				const struct fscrypt_str *iname,
 				struct fscrypt_str *oname)
 {
@@ -130,56 +130,6 @@ static const char *lookup_table =
 	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,";
 
 #define BASE64_CHARS(nbytes)	DIV_ROUND_UP((nbytes) * 4, 3)
-
-/**
- * digest_encode() -
- *
- * Encodes the input digest using characters from the set [a-zA-Z0-9_+].
- * The encoded string is roughly 4/3 times the size of the input string.
- */
-static int digest_encode(const char *src, int len, char *dst)
-{
-	int i = 0, bits = 0, ac = 0;
-	char *cp = dst;
-
-	while (i < len) {
-		ac += (((unsigned char) src[i]) << bits);
-		bits += 8;
-		do {
-			*cp++ = lookup_table[ac & 0x3f];
-			ac >>= 6;
-			bits -= 6;
-		} while (bits >= 6);
-		i++;
-	}
-	if (bits)
-		*cp++ = lookup_table[ac & 0x3f];
-	return cp - dst;
-}
-
-static int digest_decode(const char *src, int len, char *dst)
-{
-	int i = 0, bits = 0, ac = 0;
-	const char *p;
-	char *cp = dst;
-
-	while (i < len) {
-		p = strchr(lookup_table, src[i]);
-		if (p == NULL || src[i] == 0)
-			return -2;
-		ac += (p - lookup_table) << bits;
-		bits += 6;
-		if (bits >= 8) {
-			*cp++ = ac & 0xff;
-			ac >>= 8;
-			bits -= 8;
-		}
-		i++;
-	}
-	if (ac)
-		return -1;
-	return cp - dst;
-}
 
 bool fscrypt_fname_encrypted_size(const struct inode *inode, u32 orig_len,
 				  u32 max_len, u32 *encrypted_len_ret)
@@ -237,6 +187,87 @@ void fscrypt_fname_free_buffer(struct fscrypt_str *crypto_str)
 }
 EXPORT_SYMBOL(fscrypt_fname_free_buffer);
 
+static int base64_encode(const u8 *src, int len, char *dst)
+{
+        int i, bits = 0, ac = 0;
+        char *cp = dst;
+
+        for (i = 0; i < len; i++) {
+                ac += src[i] << bits;
+                bits += 8;
+                do {
+                        *cp++ = lookup_table[ac & 0x3f];
+                        ac >>= 6;
+                        bits -= 6;
+                } while (bits >= 6);
+        }
+        if (bits)
+                *cp++ = lookup_table[ac & 0x3f];
+        return cp - dst;
+}
+
+static int base64_decode(const char *src, int len, u8 *dst)
+{
+        int i, bits = 0, ac = 0;
+        const char *p;
+        u8 *cp = dst;
+
+        for (i = 0; i < len; i++) {
+                p = strchr(lookup_table, src[i]);
+                if (p == NULL || src[i] == 0)
+                        return -2;
+                ac += (p - lookup_table) << bits;
+                bits += 6;
+                if (bits >= 8) {
+                        *cp++ = ac & 0xff;
+                        ac >>= 8;
+                        bits -= 8;
+                }
+        }
+        if (ac)
+                return -1;
+        return cp - dst;
+}
+
+/*
+ * Decoded size of max-size nokey name, i.e. a name that was abbreviated using
+ * the strong hash and thus includes the 'sha256' field.  This isn't simply
+ * sizeof(struct fscrypt_nokey_name), as the padding at the end isn't included.
+ */
+#define FSCRYPT_NOKEY_NAME_MAX  offsetofend(struct fscrypt_nokey_name, sha256)
+
+struct fscrypt_nokey_name {
+        u32 dirhash[2];
+        u8 bytes[149];
+        u8 sha256[32];
+};
+
+static struct crypto_shash *sha256_hash_tfm;
+
+static int fscrypt_do_sha256(const u8 *data, unsigned int data_len, u8 *result)
+{
+    struct crypto_shash *tfm = READ_ONCE(sha256_hash_tfm);
+
+    if (unlikely(!tfm)) {
+        struct crypto_shash *prev_tfm;
+        tfm = crypto_alloc_shash("sha256", 0, 0);
+        if (IS_ERR(tfm)) {
+             return PTR_ERR(tfm);
+        }
+        prev_tfm = cmpxchg(&sha256_hash_tfm, NULL, tfm);
+        if (prev_tfm) {
+            crypto_free_shash(tfm);
+            tfm = prev_tfm;
+        }
+    }
+    {
+        SHASH_DESC_ON_STACK(desc, tfm);
+        desc->tfm = tfm;
+        desc->flags = 0;
+        return crypto_shash_digest(desc, data, data_len, result);
+    }
+}
+
 /**
  * fscrypt_fname_disk_to_usr() - converts a filename from disk space to user
  * space
@@ -249,13 +280,15 @@ EXPORT_SYMBOL(fscrypt_fname_free_buffer);
  *
  * Return: 0 on success, -errno on failure
  */
-int fscrypt_fname_disk_to_usr(struct inode *inode,
+int fscrypt_fname_disk_to_usr(const struct inode *inode,
 			u32 hash, u32 minor_hash,
 			const struct fscrypt_str *iname,
 			struct fscrypt_str *oname)
 {
 	const struct qstr qname = FSTR_TO_QSTR(iname);
-	struct fscrypt_digested_name digested_name;
+	struct fscrypt_nokey_name nokey_name;
+	u32 size; /* size of the unencoded no-key name */
+	int err;
 
 	if (fscrypt_is_dot_dotdot(&qname)) {
 		oname->name[0] = '.';
@@ -270,19 +303,38 @@ int fscrypt_fname_disk_to_usr(struct inode *inode,
 	if (fscrypt_has_encryption_key(inode))
 		return fname_decrypt(inode, iname, oname);
 
-	if (iname->len <= FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE) {
-		oname->len = digest_encode(iname->name, iname->len,
-					   oname->name);
-		return 0;
+/*
+	 * Sanity check that struct fscrypt_nokey_name doesn't have padding
+	 * between fields and that its encoded size never exceeds NAME_MAX.
+	 */
+	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, dirhash) !=
+		offsetof(struct fscrypt_nokey_name, bytes));
+	BUILD_BUG_ON(offsetofend(struct fscrypt_nokey_name, bytes) !=
+		offsetof(struct fscrypt_nokey_name, sha256));
+	BUILD_BUG_ON(BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX) > NAME_MAX);
+
+	if (hash) {
+		nokey_name.dirhash[0] = hash;
+		nokey_name.dirhash[1] = minor_hash;
+	} else {
+		nokey_name.dirhash[0] = 0;
+		nokey_name.dirhash[1] = 0;
+
 	}
-	digested_name.hash = hash;
-	digested_name.minor_hash = minor_hash;
-	memcpy(digested_name.digest,
-	       FSCRYPT_FNAME_DIGEST(iname->name, iname->len),
-	       FSCRYPT_FNAME_DIGEST_SIZE);
-	oname->name[0] = '_';
-	oname->len = 1 + digest_encode((const char *)&digested_name,
-				       sizeof(digested_name), oname->name + 1);
+	if (iname->len <= sizeof(nokey_name.bytes)) {
+		memcpy(nokey_name.bytes, iname->name, iname->len);
+		size = offsetof(struct fscrypt_nokey_name, bytes[iname->len]);
+	} else {
+		memcpy(nokey_name.bytes, iname->name, sizeof(nokey_name.bytes));
+		/* Compute strong hash of remaining part of name. */
+		err = fscrypt_do_sha256(&iname->name[sizeof(nokey_name.bytes)],
+					iname->len - sizeof(nokey_name.bytes),
+					nokey_name.sha256);
+		if (err)
+			return err;
+		size = FSCRYPT_NOKEY_NAME_MAX;
+	}
+	oname->len = base64_encode((const u8 *)&nokey_name, size, oname->name);
 	return 0;
 }
 EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
@@ -314,8 +366,8 @@ EXPORT_SYMBOL(fscrypt_fname_disk_to_usr);
 int fscrypt_setup_filename(struct inode *dir, const struct qstr *iname,
 			      int lookup, struct fscrypt_name *fname)
 {
+    struct fscrypt_nokey_name *nokey_name;
 	int ret;
-	int digested;
 
 	memset(fname, 0, sizeof(struct fscrypt_name));
 	fname->usr_fname = iname;
@@ -355,40 +407,30 @@ int fscrypt_setup_filename(struct inode *dir, const struct qstr *iname,
 	 * We don't have the key and we are doing a lookup; decode the
 	 * user-supplied name
 	 */
-	if (iname->name[0] == '_') {
-		if (iname->len !=
-		    1 + BASE64_CHARS(sizeof(struct fscrypt_digested_name)))
-			return -ENOENT;
-		digested = 1;
-	} else {
-		if (iname->len >
-		    BASE64_CHARS(FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE))
-			return -ENOENT;
-		digested = 0;
-	}
+	if (iname->len > BASE64_CHARS(FSCRYPT_NOKEY_NAME_MAX))
+		return -ENOENT;
 
-	fname->crypto_buf.name =
-		kmalloc(max_t(size_t, FSCRYPT_FNAME_MAX_UNDIGESTED_SIZE,
-			      sizeof(struct fscrypt_digested_name)),
+	fname->crypto_buf.name = kmalloc(FSCRYPT_NOKEY_NAME_MAX,
 			GFP_KERNEL);
 	if (fname->crypto_buf.name == NULL)
 		return -ENOMEM;
 
-	ret = digest_decode(iname->name + digested, iname->len - digested,
-				fname->crypto_buf.name);
-	if (ret < 0) {
+	ret = base64_decode(iname->name, iname->len, fname->crypto_buf.name);
+	if (ret < (int)offsetof(struct fscrypt_nokey_name, bytes[1]) ||
+	   (ret > offsetof(struct fscrypt_nokey_name, sha256) &&
+	   ret != FSCRYPT_NOKEY_NAME_MAX)) {
 		ret = -ENOENT;
 		goto errout;
 	}
 	fname->crypto_buf.len = ret;
-	if (digested) {
-		const struct fscrypt_digested_name *n =
-			(const void *)fname->crypto_buf.name;
-		fname->hash = n->hash;
-		fname->minor_hash = n->minor_hash;
-	} else {
-		fname->disk_name.name = fname->crypto_buf.name;
-		fname->disk_name.len = fname->crypto_buf.len;
+	nokey_name = (void *)fname->crypto_buf.name;
+	fname->hash = nokey_name->dirhash[0];
+	fname->minor_hash = nokey_name->dirhash[1];
+	if (ret != FSCRYPT_NOKEY_NAME_MAX) {
+		/* The full ciphertext filename is available. */
+		fname->disk_name.name = nokey_name->bytes;
+		fname->disk_name.len =
+			ret - offsetof(struct fscrypt_nokey_name, bytes);
 	}
 	return 0;
 
