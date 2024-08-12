@@ -287,6 +287,15 @@ enum blk_eh_timer_return {
 	BLK_EH_RESET_TIMER,
 };
 
+/*
+ * Zoned block device models (zoned limit).
+ */
+enum blk_zoned_model {
+	BLK_ZONED_NONE,	/* Regular block device */
+	BLK_ZONED_HA,	/* Host-aware zoned block device */
+	BLK_ZONED_HM,	/* Host-managed zoned block device */
+};
+
 typedef enum blk_eh_timer_return (rq_timed_out_fn)(struct request *);
 
 enum blk_queue_state {
